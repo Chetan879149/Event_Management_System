@@ -148,3 +148,4 @@ Stores login sessions for signed-in users.
 3. Create an account or use the demo login.
 4. Create events, send messages, and book events.
 5. Check the SQLite database file to see the saved data.
+# Event_Management_System
