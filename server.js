@@ -1,0 +1,758 @@
+const express = require('express');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
+const path = require('path');
+
+const app = express();
+const port = process.env.PORT || 3000;
+const databasePath = path.join(__dirname, 'eventflow.db');
+const database = new Database(databasePath);
+
+const schemaSql = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    event_date TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    location TEXT,
+    category TEXT NOT NULL,
+    description TEXT,
+    ticket_price REAL NOT NULL DEFAULT 0,
+    max_attendees INTEGER,
+    image_path TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    subject TEXT,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    event_id INTEGER NOT NULL,
+    attendee_name TEXT NOT NULL,
+    attendee_email TEXT NOT NULL,
+    ticket_quantity INTEGER NOT NULL DEFAULT 1,
+    total_price REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'confirmed',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, event_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    session_token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS password_resets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`;
+
+database.exec(schemaSql);
+
+// Ensure users table has branding_image column (SQLite ALTER only if missing)
+try {
+  const cols = database.prepare("PRAGMA table_info(users)").all();
+  const hasBranding = cols.some(c => c.name === 'branding_image');
+  if (!hasBranding) {
+    database.prepare('ALTER TABLE users ADD COLUMN branding_image TEXT').run();
+  }
+} catch (e) {
+  // ignore if ALTER fails for any reason
+}
+
+// Subscriptions table to persist user plan selections
+database.exec(`
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  plan TEXT NOT NULL,
+  price TEXT,
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`);
+
+const createPasswordResetTransport = () => {
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpPort = Number(process.env.SMTP_PORT || 587);
+  const smtpSecure = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+
+  if (!smtpHost) {
+    return null;
+  }
+
+  const transportOptions = {
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
+    auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined
+  };
+
+  return nodemailer.createTransport(transportOptions);
+};
+
+const sendPasswordResetEmail = async (email, resetLink) => {
+  const transporter = createPasswordResetTransport();
+  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER || 'no-reply@eventflow.local';
+
+  if (!transporter) {
+    console.log(`Password reset link for ${email}: ${resetLink}`);
+    return;
+  }
+
+  await transporter.sendMail({
+    from: fromAddress,
+    to: email,
+    subject: 'EventFlow password reset',
+    text: `Use this link to reset your password: ${resetLink}`,
+    html: `<p>Use this link to reset your password:</p><p><a href="${resetLink}">${resetLink}</a></p>`
+  });
+};
+
+const ensureDemoUser = () => {
+  const existing = database.prepare('SELECT id, password_hash FROM users WHERE email = ?').get('demo@eventflow.com');
+
+  if (!existing) {
+    const passwordHash = bcrypt.hashSync('demo1234', 12);
+    database.prepare(`
+      INSERT INTO users (first_name, last_name, email, password_hash)
+      VALUES (?, ?, ?, ?)
+    `).run('Demo', 'User', 'demo@eventflow.com', passwordHash);
+    return;
+  }
+
+  const currentHash = existing.password_hash || '';
+  const isSha256Hash = /^[a-f0-9]{64}$/i.test(currentHash);
+  if (isSha256Hash) {
+    const passwordHash = bcrypt.hashSync('demo1234', 12);
+    database.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, existing.id);
+  }
+};
+
+ensureDemoUser();
+
+const seedDefaultEvents = () => {
+  const demoUser = database.prepare('SELECT id FROM users WHERE email = ?').get('demo@eventflow.com');
+  if (!demoUser) return;
+  const userId = demoUser.id;
+
+  const defaultEvents = [
+    {
+      title: 'Global Tech Summit 2024',
+      date: 'December 20, 2024',
+      time: '9:00 AM',
+      location: 'San Francisco, CA',
+      category: 'conference',
+      description: 'Join industry leaders and innovators for the biggest tech event of the year.',
+      ticketPrice: 299,
+      maxAttendees: 2500,
+      imagePath: 'https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=400&h=250&fit=crop'
+    },
+    {
+      title: 'Neon Nights Music Festival',
+      date: 'January 5-7, 2025',
+      time: '6:00 PM',
+      location: 'Las Vegas, NV',
+      category: 'music',
+      description: 'Three days of non-stop music featuring world-renowned artists and DJs.',
+      ticketPrice: 149,
+      maxAttendees: 50000,
+      imagePath: 'https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?w=400&h=250&fit=crop'
+    },
+    {
+      title: 'UI/UX Design Masterclass',
+      date: 'December 28, 2024',
+      time: '10:00 AM',
+      location: 'Online Event',
+      category: 'workshop',
+      description: 'Learn cutting-edge design techniques from industry experts.',
+      ticketPrice: 79,
+      maxAttendees: 500,
+      imagePath: 'https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?w=400&h=250&fit=crop'
+    },
+    {
+      title: 'City Marathon 2025',
+      date: 'February 15, 2025',
+      time: '6:00 AM',
+      location: 'New York, NY',
+      category: 'sports',
+      description: 'Run through scenic routes and challenge yourself in the annual city marathon.',
+      ticketPrice: 50,
+      maxAttendees: 20000,
+      imagePath: 'https://images.unsplash.com/photo-1461896836934-a2a0d8c0b1f2?w=400&h=250&fit=crop'
+    },
+    {
+      title: 'Future of Business Summit',
+      date: 'January 20, 2025',
+      time: '9:00 AM',
+      location: 'London, UK',
+      category: 'conference',
+      description: 'Explore emerging trends and network with business leaders worldwide.',
+      ticketPrice: 399,
+      maxAttendees: 3000,
+      imagePath: 'https://images.unsplash.com/photo-1505373877841-8d25f7d46678?w=400&h=250&fit=crop'
+    },
+    {
+      title: "New Year's Eve Concert",
+      date: 'December 31, 2024',
+      time: '10:00 PM',
+      location: 'Miami, FL',
+      category: 'music',
+      description: 'Ring in the new year with an unforgettable live music experience.',
+      ticketPrice: 199,
+      maxAttendees: 15000,
+      imagePath: 'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=400&h=250&fit=crop'
+    }
+  ];
+
+  const insert = database.prepare(`
+    INSERT INTO events (user_id, title, event_date, event_time, location, category, description, ticket_price, max_attendees, image_path)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  defaultEvents.forEach(ev => {
+    const exists = database.prepare('SELECT id FROM events WHERE title = ?').get(ev.title);
+    if (!exists) {
+      insert.run(
+        userId,
+        ev.title,
+        ev.date,
+        ev.time,
+        ev.location,
+        ev.category,
+        ev.description,
+        ev.ticketPrice,
+        ev.maxAttendees,
+        ev.imagePath
+      );
+    }
+  });
+};
+
+seedDefaultEvents();
+
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(__dirname));
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  const { firstName, lastName, email, password } = req.body;
+
+  if (!firstName || !lastName || !email || !password) {
+    return res.status(400).json({ error: 'Please fill in all fields.' });
+  }
+
+  const emailNormalized = String(email).trim().toLowerCase();
+  const existingUser = database.prepare('SELECT id FROM users WHERE email = ?').get(emailNormalized);
+
+  if (existingUser) {
+    return res.status(409).json({ error: 'An account with that email already exists.' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(password), 12);
+  const result = database.prepare(`
+    INSERT INTO users (first_name, last_name, email, password_hash)
+    VALUES (?, ?, ?, ?)
+  `).run(String(firstName).trim(), String(lastName).trim(), emailNormalized, passwordHash);
+
+  res.status(201).json({
+    message: 'Account created successfully.',
+    user: {
+      id: result.lastInsertRowid,
+      firstName: String(firstName).trim(),
+      lastName: String(lastName).trim(),
+      email: emailNormalized
+    }
+  });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required.' });
+  }
+
+  const user = database.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim().toLowerCase());
+
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid email or password.' });
+  }
+
+  const validPassword = await bcrypt.compare(String(password), user.password_hash);
+  if (!validPassword) {
+    return res.status(401).json({ error: 'Invalid email or password.' });
+  }
+
+  const sessionToken = crypto.randomBytes(24).toString('hex');
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString();
+
+  database.prepare(`
+    INSERT INTO sessions (user_id, session_token, expires_at)
+    VALUES (?, ?, ?)
+  `).run(user.id, sessionToken, expiresAt);
+
+  res.json({
+    message: 'Login successful.',
+    token: sessionToken,
+    user: {
+      id: user.id,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      email: user.email
+    }
+  });
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required.' });
+  }
+
+  const emailNormalized = String(email).trim().toLowerCase();
+  const user = database.prepare('SELECT id FROM users WHERE email = ?').get(emailNormalized);
+
+  if (user) {
+    const token = crypto.randomBytes(24).toString('hex');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    database.prepare(`
+      INSERT INTO password_resets (user_id, token, expires_at)
+      VALUES (?, ?, ?)
+    `).run(user.id, token, expiresAt);
+
+    const resetLink = `${req.protocol}://${req.get('host')}/resetPasswordModal.html?token=${token}`;
+    await sendPasswordResetEmail(emailNormalized, resetLink);
+  }
+
+  res.json({ message: 'Password reset instructions have been sent if the email exists.' });
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and new password are required.' });
+  }
+
+  const resetRecord = database.prepare(`
+    SELECT id, user_id, expires_at FROM password_resets WHERE token = ?
+  `).get(String(token).trim());
+
+  if (!resetRecord) {
+    return res.status(400).json({ error: 'Invalid or expired reset token.' });
+  }
+
+  if (new Date(resetRecord.expires_at) < new Date()) {
+    database.prepare('DELETE FROM password_resets WHERE id = ?').run(resetRecord.id);
+    return res.status(400).json({ error: 'Invalid or expired reset token.' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(newPassword), 12);
+  database.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, resetRecord.user_id);
+  database.prepare('DELETE FROM password_resets WHERE id = ?').run(resetRecord.id);
+
+  res.json({ message: 'Password updated successfully.' });
+});
+
+app.post('/api/contact', (req, res) => {
+  const { firstName, lastName, email, subject, message } = req.body;
+
+  if (!firstName || !lastName || !email || !message) {
+    return res.status(400).json({ error: 'Please fill in the contact form.' });
+  }
+
+  const result = database.prepare(`
+    INSERT INTO contacts (first_name, last_name, email, subject, message)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(String(firstName).trim(), String(lastName).trim(), String(email).trim(), String(subject || '').trim(), String(message).trim());
+
+  res.status(201).json({ message: 'Contact message saved.', id: result.lastInsertRowid });
+});
+
+app.post('/api/events', (req, res) => {
+  const {
+    userId = 1,
+    title,
+    date,
+    time,
+    location,
+    category,
+    description,
+    ticketPrice = 0,
+    maxAttendees = null,
+    imagePath = null
+  } = req.body;
+
+  if (!title || !date || !time || !category) {
+    return res.status(400).json({ error: 'Title, date, time, and category are required.' });
+  }
+
+  const result = database.prepare(`
+    INSERT INTO events (
+      user_id, title, event_date, event_time, location, category, description, ticket_price, max_attendees, image_path
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(userId),
+    String(title).trim(),
+    String(date),
+    String(time),
+    String(location || '').trim(),
+    String(category).trim(),
+    String(description || '').trim(),
+    Number(ticketPrice) || 0,
+    maxAttendees === '' || maxAttendees === null ? null : Number(maxAttendees),
+    imagePath ? String(imagePath) : null
+  );
+
+  res.status(201).json({ message: 'Event saved.', id: result.lastInsertRowid });
+});
+
+app.post('/api/bookings', (req, res) => {
+  const { userId = null, eventId, attendeeName, attendeeEmail, ticketQuantity = 1, totalPrice = 0 } = req.body;
+
+  if (!eventId || !attendeeName || !attendeeEmail) {
+    return res.status(400).json({ error: 'Booking details are incomplete.' });
+  }
+
+  const result = database.prepare(`
+    INSERT INTO bookings (user_id, event_id, attendee_name, attendee_email, ticket_quantity, total_price)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    userId ? Number(userId) : null,
+    Number(eventId),
+    String(attendeeName).trim(),
+    String(attendeeEmail).trim(),
+    Number(ticketQuantity) || 1,
+    Number(totalPrice) || 0
+  );
+
+  res.status(201).json({ message: 'Booking saved.', id: result.lastInsertRowid });
+});
+
+app.post('/api/favorites', (req, res) => {
+  const { userId, eventId } = req.body;
+
+  if (!userId || !eventId) {
+    return res.status(400).json({ error: 'User and event are required.' });
+  }
+
+  database.prepare(`
+    INSERT OR IGNORE INTO favorites (user_id, event_id)
+    VALUES (?, ?)
+  `).run(Number(userId), Number(eventId));
+
+  res.status(201).json({ message: 'Favorite saved.' });
+});
+
+app.get('/api/events', (req, res) => {
+  const events = database.prepare(`
+    SELECT events.*, users.first_name, users.last_name
+    FROM events
+    JOIN users ON users.id = events.user_id
+    ORDER BY events.created_at DESC
+  `).all();
+
+  res.json(events);
+});
+
+// Persist a subscription (trial or paid) for a user
+app.post('/api/subscription', (req, res) => {
+  const { userId, plan, price } = req.body;
+
+  if (!userId || !plan) {
+    return res.status(400).json({ error: 'userId and plan are required.' });
+  }
+
+  const result = database.prepare(`
+    INSERT INTO subscriptions (user_id, plan, price)
+    VALUES (?, ?, ?)
+  `).run(Number(userId), String(plan), String(price || ''));
+
+  res.status(201).json({ message: 'Subscription saved.', id: result.lastInsertRowid });
+});
+
+app.get('/api/subscription/:userId', (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid userId' });
+
+  const sub = database.prepare(`
+    SELECT * FROM subscriptions WHERE user_id = ? ORDER BY started_at DESC LIMIT 1
+  `).get(userId);
+
+  res.json(sub || {});
+});
+
+// Branding endpoints: store/retrieve a base64 image for user
+app.post('/api/branding', (req, res) => {
+  const { userId, image } = req.body;
+  if (!userId || !image) return res.status(400).json({ error: 'userId and image are required.' });
+
+  const result = database.prepare('UPDATE users SET branding_image = ? WHERE id = ?').run(String(image), Number(userId));
+  if (result.changes === 0) return res.status(404).json({ error: 'User not found.' });
+
+  res.json({ message: 'Branding saved.' });
+});
+
+app.get('/api/branding/:userId', (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!userId) return res.status(400).json({ error: 'Invalid userId' });
+
+  const row = database.prepare('SELECT branding_image FROM users WHERE id = ?').get(userId);
+  res.json({ image: row?.branding_image || null });
+});
+
+const adminTableQueries = {
+  users: `
+    SELECT id, first_name AS firstName, last_name AS lastName, email, created_at AS createdAt
+    FROM users
+    ORDER BY created_at DESC
+  `,
+  events: `
+    SELECT events.id, events.title, events.event_date AS eventDate, events.event_time AS eventTime,
+           events.location, events.category, events.description, events.ticket_price AS ticketPrice,
+           events.max_attendees AS maxAttendees, events.image_path AS imagePath,
+           events.created_at AS createdAt,
+           users.first_name AS organizerFirstName,
+           users.last_name AS organizerLastName,
+           users.email AS organizerEmail
+    FROM events
+    JOIN users ON users.id = events.user_id
+    ORDER BY events.created_at DESC
+  `,
+  contacts: `
+    SELECT id, first_name AS firstName, last_name AS lastName, email, subject, message, created_at AS createdAt
+    FROM contacts
+    ORDER BY created_at DESC
+  `,
+  bookings: `
+    SELECT bookings.id, bookings.event_id AS eventId, bookings.user_id AS userId,
+           bookings.attendee_name AS attendeeName, bookings.attendee_email AS attendeeEmail,
+           bookings.ticket_quantity AS ticketQuantity, bookings.total_price AS totalPrice,
+           bookings.status, bookings.created_at AS createdAt,
+           events.title AS eventTitle
+    FROM bookings
+    JOIN events ON events.id = bookings.event_id
+    ORDER BY bookings.created_at DESC
+  `,
+  favorites: `
+    SELECT favorites.id, favorites.user_id AS userId, favorites.event_id AS eventId,
+           favorites.created_at AS createdAt,
+           users.email AS userEmail,
+           events.title AS eventTitle
+    FROM favorites
+    JOIN users ON users.id = favorites.user_id
+    JOIN events ON events.id = favorites.event_id
+    ORDER BY favorites.created_at DESC
+  `,
+  sessions: `
+    SELECT sessions.id, sessions.user_id AS userId, sessions.session_token AS sessionToken,
+           sessions.created_at AS createdAt, sessions.expires_at AS expiresAt,
+           users.email AS userEmail
+    FROM sessions
+    JOIN users ON users.id = sessions.user_id
+    ORDER BY sessions.created_at DESC
+  `
+};
+
+const adminEditColumns = {
+  users: {
+    table: 'users',
+    columns: {
+      firstName: 'first_name',
+      lastName: 'last_name',
+      email: 'email'
+    }
+  },
+  events: {
+    table: 'events',
+    columns: {
+      title: 'title',
+      eventDate: 'event_date',
+      eventTime: 'event_time',
+      location: 'location',
+      category: 'category',
+      description: 'description',
+      ticketPrice: 'ticket_price',
+      maxAttendees: 'max_attendees',
+      imagePath: 'image_path'
+    }
+  },
+  contacts: {
+    table: 'contacts',
+    columns: {
+      firstName: 'first_name',
+      lastName: 'last_name',
+      email: 'email',
+      subject: 'subject',
+      message: 'message'
+    }
+  },
+  bookings: {
+    table: 'bookings',
+    columns: {
+      attendeeName: 'attendee_name',
+      attendeeEmail: 'attendee_email',
+      ticketQuantity: 'ticket_quantity',
+      totalPrice: 'total_price',
+      status: 'status'
+    }
+  }
+};
+
+const adminDeleteTables = new Set(['users', 'events', 'contacts', 'bookings', 'favorites', 'sessions']);
+
+app.patch('/api/admin/records/:table/:id', (req, res) => {
+  const tableName = String(req.params.table || '').toLowerCase();
+  const recordId = Number(req.params.id);
+  const config = adminEditColumns[tableName];
+
+  if (!config || !recordId) {
+    return res.status(400).json({ error: 'Invalid record request.' });
+  }
+
+  const updates = [];
+  const values = [];
+
+  Object.entries(config.columns).forEach(([requestKey, columnName]) => {
+    if (Object.prototype.hasOwnProperty.call(req.body, requestKey)) {
+      updates.push(`${columnName} = ?`);
+      values.push(req.body[requestKey] === '' ? null : req.body[requestKey]);
+    }
+  });
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No editable fields were provided.' });
+  }
+
+  const statement = database.prepare(`
+    UPDATE ${config.table}
+    SET ${updates.join(', ')}
+    WHERE id = ?
+  `);
+
+  const result = statement.run(...values, recordId);
+
+  if (result.changes === 0) {
+    return res.status(404).json({ error: 'Record not found.' });
+  }
+
+  res.json({ message: 'Record updated.' });
+});
+
+app.delete('/api/admin/records/:table/:id', (req, res) => {
+  const tableName = String(req.params.table || '').toLowerCase();
+  const recordId = Number(req.params.id);
+
+  if (!adminDeleteTables.has(tableName) || !recordId) {
+    return res.status(400).json({ error: 'Invalid record request.' });
+  }
+
+  const tableMap = {
+    users: 'users',
+    events: 'events',
+    contacts: 'contacts',
+    bookings: 'bookings',
+    favorites: 'favorites',
+    sessions: 'sessions'
+  };
+
+  const result = database.prepare(`DELETE FROM ${tableMap[tableName]} WHERE id = ?`).run(recordId);
+
+  if (result.changes === 0) {
+    return res.status(404).json({ error: 'Record not found.' });
+  }
+
+  res.json({ message: 'Record deleted.' });
+});
+
+app.get('/api/admin/stats', (req, res) => {
+  const stats = {
+    users: database.prepare('SELECT COUNT(*) AS count FROM users').get().count,
+    events: database.prepare('SELECT COUNT(*) AS count FROM events').get().count,
+    contacts: database.prepare('SELECT COUNT(*) AS count FROM contacts').get().count,
+    bookings: database.prepare('SELECT COUNT(*) AS count FROM bookings').get().count,
+    favorites: database.prepare('SELECT COUNT(*) AS count FROM favorites').get().count,
+    sessions: database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count
+  };
+
+  res.json(stats);
+});
+
+app.get('/api/admin/records', (req, res) => {
+  const table = String(req.query.table || '').toLowerCase();
+  const query = adminTableQueries[table];
+
+  if (!query) {
+    return res.status(400).json({ error: 'Unknown table requested.' });
+  }
+
+  const rows = database.prepare(query).all();
+  res.json({ table, rows });
+});
+
+app.get('/api/users/current', (req, res) => {
+  const currentUser = database.prepare(`
+    SELECT id, first_name AS firstName, last_name AS lastName, email
+    FROM users
+    WHERE email = ?
+  `).get('demo@eventflow.com');
+
+  res.json(currentUser);
+});
+
+app.listen(port, () => {
+  console.log(`EventFlow server running at http://localhost:${port}`);
+});

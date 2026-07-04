@@ -1,0 +1,411 @@
+document.addEventListener('DOMContentLoaded', () => {
+    const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+    const mobileMenu = document.getElementById('mobileMenu');
+    const navbar = document.getElementById('navbar');
+    const filterBtns = document.querySelectorAll('.filter-btn');
+    const eventCards = document.querySelectorAll('.event-card');
+    const counters = document.querySelectorAll('.counter');
+    const pricingToggle = document.getElementById('pricingToggle');
+    const contactForm = document.getElementById('contactForm');
+    const createEventForm = document.getElementById('createEventForm');
+    const loginForm = document.querySelector('#loginModal form');
+    const registerForm = document.querySelector('#registerModal form');
+
+    const getInputValue = (form, selector) => {
+        const input = form ? form.querySelector(selector) : null;
+        return input ? input.value.trim() : '';
+    };
+
+    const apiRequest = async (url, method, body) => {
+        const response = await fetch(url, {
+            method,
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: body ? JSON.stringify(body) : undefined
+        });
+
+        const payload = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(payload.error || 'Something went wrong.');
+        }
+
+        return payload;
+    };
+
+    window.scrollToSection = (sectionId) => {
+        const section = document.getElementById(sectionId);
+        if (section) {
+            section.scrollIntoView({ behavior: 'smooth' });
+        }
+    };
+
+    window.openModal = (modalId) => {
+        const modal = document.getElementById(modalId);
+        if (modal) {
+            modal.classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+        }
+    };
+
+    window.closeModal = (modalId) => {
+        const modal = document.getElementById(modalId);
+        if (modal) {
+            modal.classList.add('hidden');
+            document.body.style.overflow = 'auto';
+        }
+    };
+
+    document.addEventListener('click', (event) => {
+        const actionElement = event.target.closest('[data-open-modal], [data-close-modal], [data-scroll-target]');
+
+        if (!actionElement) {
+            return;
+        }
+
+        if (actionElement.dataset.closeModal) {
+            window.closeModal(actionElement.dataset.closeModal);
+        }
+
+        if (actionElement.dataset.openModal) {
+            window.openModal(actionElement.dataset.openModal);
+        }
+
+        if (actionElement.dataset.scrollTarget) {
+            window.scrollToSection(actionElement.dataset.scrollTarget);
+        }
+    });
+
+    const showToast = (message, type = 'success') => {
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+        const toastIcon = document.getElementById('toastIcon');
+
+        if (!toast || !toastMessage || !toastIcon) {
+            return;
+        }
+
+        toastMessage.textContent = message;
+
+        if (type === 'success') {
+            toastIcon.className = 'w-8 h-8 rounded-full bg-green-500 flex items-center justify-center';
+            toastIcon.innerHTML = '<i class="fas fa-check"></i>';
+        } else if (type === 'error') {
+            toastIcon.className = 'w-8 h-8 rounded-full bg-red-500 flex items-center justify-center';
+            toastIcon.innerHTML = '<i class="fas fa-times"></i>';
+        }
+
+        toast.classList.remove('hidden');
+
+        window.setTimeout(() => {
+            toast.classList.add('hidden');
+        }, 3000);
+    };
+
+    window.showToast = showToast;
+
+    if (mobileMenuBtn && mobileMenu) {
+        mobileMenuBtn.addEventListener('click', () => {
+            mobileMenu.classList.toggle('hidden');
+            const icon = mobileMenuBtn.querySelector('i');
+
+            if (icon) {
+                icon.classList.toggle('fa-bars');
+                icon.classList.toggle('fa-times');
+            }
+        });
+
+        document.querySelectorAll('#mobileMenu a').forEach(link => {
+            link.addEventListener('click', () => {
+                mobileMenu.classList.add('hidden');
+                const icon = mobileMenuBtn.querySelector('i');
+                if (icon) {
+                    icon.classList.add('fa-bars');
+                    icon.classList.remove('fa-times');
+                }
+            });
+        });
+    }
+
+    if (navbar) {
+        window.addEventListener('scroll', () => {
+            if (window.pageYOffset > 50) {
+                navbar.classList.add('glass-card', 'py-2');
+            } else {
+                navbar.classList.remove('glass-card', 'py-2');
+            }
+        });
+    }
+
+    window.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            document.querySelectorAll('.fixed.z-50:not(.hidden)').forEach(modal => {
+                modal.classList.add('hidden');
+                document.body.style.overflow = 'auto';
+            });
+        }
+    });
+
+    filterBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            filterBtns.forEach(button => button.classList.remove('active', 'bg-primary-500'));
+            btn.classList.add('active', 'bg-primary-500');
+
+            const filter = btn.dataset.filter;
+
+            eventCards.forEach(card => {
+                if (filter === 'all' || card.dataset.category === filter) {
+                    card.style.display = 'block';
+                    card.classList.add('animate-fade-in');
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        });
+    });
+
+    document.querySelectorAll('.bookmark-btn').forEach(btn => {
+        btn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            const icon = btn.querySelector('i');
+
+            if (!icon) {
+                return;
+            }
+
+            icon.classList.toggle('far');
+            icon.classList.toggle('fas');
+            icon.classList.toggle('text-red-500');
+
+            showToast(icon.classList.contains('fas') ? 'Added to favorites!' : 'Removed from favorites');
+        });
+    });
+
+    const animateCounter = (counter) => {
+        const target = Number(counter.getAttribute('data-target'));
+        const count = Number(counter.innerText.replace(/[^0-9]/g, '')) || 0;
+        const increment = target / 200;
+
+        if (count < target) {
+            counter.innerText = Math.ceil(count + increment);
+            window.setTimeout(() => animateCounter(counter), 10);
+        } else {
+            counter.innerText = `${target}${target === 98 ? '%' : '+'}`;
+        }
+    };
+
+    if (counters.length > 0) {
+        const observer = new IntersectionObserver((entries, observerInstance) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    counters.forEach(counter => animateCounter(counter));
+                    observerInstance.unobserve(entry.target);
+                }
+            });
+        }, { threshold: 0.5 });
+
+        observer.observe(counters[0].parentElement.parentElement);
+    }
+
+    if (pricingToggle) {
+        let isAnnual = false;
+
+        pricingToggle.addEventListener('click', () => {
+            isAnnual = !isAnnual;
+            const toggle = pricingToggle.querySelector('span');
+
+            if (toggle) {
+                toggle.style.transform = isAnnual ? 'translateX(28px)' : 'translateX(0)';
+            }
+
+            pricingToggle.classList.toggle('bg-primary-500', isAnnual);
+        });
+    }
+
+    if (contactForm) {
+        contactForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+
+            const firstName = getInputValue(contactForm, '#contactFirstName');
+            const lastName = getInputValue(contactForm, '#contactLastName');
+            const email = getInputValue(contactForm, '#contactEmail');
+            const subject = contactForm.querySelector('#contactSubject')?.value || '';
+            const message = getInputValue(contactForm, '#contactMessage');
+
+            try {
+                await apiRequest('/api/contact', 'POST', { firstName, lastName, email, subject, message });
+                showToast('Message sent successfully!');
+                contactForm.reset();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+    }
+
+    if (loginForm) {
+        loginForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+
+            const email = getInputValue(loginForm, '#loginEmail');
+            const password = getInputValue(loginForm, '#loginPassword');
+
+            if (!email || !password) {
+                showToast('Enter your email and password.', 'error');
+                return;
+            }
+
+            try {
+                const result = await apiRequest('/api/auth/login', 'POST', { email, password });
+                localStorage.setItem('eventflow-session', result.token);
+                loginForm.reset();
+                window.closeModal('loginModal');
+                showToast(`Welcome back, ${result.user.firstName || 'User'}!`);
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+    }
+
+    if (registerForm) {
+        registerForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+
+            const firstName = getInputValue(registerForm, '#registerFirstName');
+            const lastName = getInputValue(registerForm, '#registerLastName');
+            const email = getInputValue(registerForm, '#registerEmail');
+            const password = getInputValue(registerForm, '#registerPassword');
+            const termsAccepted = registerForm.querySelector('#registerTerms')?.checked;
+
+            if (!firstName || !lastName || !email || !password) {
+                showToast('Please complete all fields.', 'error');
+                return;
+            }
+
+            if (!termsAccepted) {
+                showToast('Please accept the terms to continue.', 'error');
+                return;
+            }
+
+            try {
+                const result = await apiRequest('/api/auth/register', 'POST', { firstName, lastName, email, password });
+                localStorage.setItem('eventflow-session', String(result.user.id));
+                registerForm.reset();
+                window.closeModal('registerModal');
+                showToast(`Account created for ${result.user.firstName}.`);
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+    }
+
+    if (createEventForm) {
+        createEventForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+
+            const title = getInputValue(createEventForm, '#eventName');
+            const date = getInputValue(createEventForm, '#eventDate');
+            const time = getInputValue(createEventForm, '#eventTime');
+            const location = getInputValue(createEventForm, '#eventLocation');
+            const category = createEventForm.querySelector('#eventCategory')?.value || '';
+            const description = getInputValue(createEventForm, '#eventDescription');
+            const ticketPrice = getInputValue(createEventForm, '#ticketPrice');
+            const maxAttendees = getInputValue(createEventForm, '#maxAttendees');
+            const uploadInput = createEventForm.querySelector('#eventImageInput');
+
+            const imagePath = uploadInput?.files?.[0] ? uploadInput.files[0].name : null;
+
+            try {
+                await apiRequest('/api/events', 'POST', {
+                    userId: 1,
+                    title,
+                    date,
+                    time,
+                    location,
+                    category,
+                    description,
+                    ticketPrice,
+                    maxAttendees,
+                    imagePath
+                });
+
+                showToast('Event created successfully!');
+                window.closeModal('createEventModal');
+                createEventForm.reset();
+
+                const preview = document.querySelector('[data-upload-preview]');
+                const placeholder = document.querySelector('[data-upload-placeholder]');
+                const uploadText = document.querySelector('[data-upload-text]');
+
+                if (preview && placeholder && uploadText) {
+                    preview.src = '';
+                    preview.classList.add('hidden');
+                    placeholder.classList.remove('hidden');
+                    uploadText.textContent = 'Drop your image here or click to upload';
+                }
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        });
+    }
+
+    document.querySelectorAll('input[type="file"]').forEach(input => {
+        const wrapper = input.parentElement;
+        const preview = wrapper ? wrapper.querySelector('[data-upload-preview]') : null;
+        const placeholder = wrapper ? wrapper.querySelector('[data-upload-placeholder]') : null;
+        const uploadText = wrapper ? wrapper.querySelector('[data-upload-text]') : null;
+
+        if (!wrapper) {
+            return;
+        }
+
+        wrapper.addEventListener('click', () => input.click());
+
+        input.addEventListener('change', (event) => {
+            if (event.target.files.length > 0) {
+                const fileName = event.target.files[0].name;
+                const file = event.target.files[0];
+
+                if (uploadText) {
+                    uploadText.textContent = fileName;
+                }
+
+                if (placeholder) {
+                    placeholder.classList.add('hidden');
+                }
+
+                if (preview) {
+                    const reader = new FileReader();
+
+                    reader.onload = (loadEvent) => {
+                        preview.src = loadEvent.target.result;
+                        preview.classList.remove('hidden');
+                    };
+
+                    reader.readAsDataURL(file);
+                }
+            }
+        });
+    });
+
+    const animateOnScroll = () => {
+        document.querySelectorAll('.glass-card, .event-card').forEach(element => {
+            const elementTop = element.getBoundingClientRect().top;
+            const windowHeight = window.innerHeight;
+
+            if (elementTop < windowHeight - 100) {
+                element.style.opacity = '1';
+                element.style.transform = 'translateY(0)';
+            }
+        });
+    };
+
+    document.querySelectorAll('.glass-card, .event-card').forEach(element => {
+        element.style.opacity = '0';
+        element.style.transform = 'translateY(30px)';
+        element.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
+    });
+
+    window.addEventListener('scroll', animateOnScroll);
+    window.addEventListener('load', animateOnScroll);
+});
